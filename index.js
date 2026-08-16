@@ -281,11 +281,15 @@ function registerSearchTool(ctx) {
       'Search the web by round-robin calling Keenable / Exa / Tavily, with automatic failover.',
       'Use when the current task needs current web information, links, or content summaries.',
       'Configure at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY in the environment.',
+      '',
+      '中文：轮流调用 Keenable / Exa / Tavily 搜索网页，自动故障切换。',
+      '当需要最新网页信息、链接或内容摘要时使用。',
+      '需要配置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY 中的至少一个。',
     ].join('\n'),
     parameters: toJsonSchema({
-      query: { type: 'string', required: true, description: '搜索关键词或自然语言问题' },
-      max_results: { type: 'number', required: false, description: '返回结果条数，1-20，默认 8' },
-      time_range: { type: 'string', required: false, description: '可选：day / week / month / year' },
+      query: { type: 'string', required: true, description: '搜索关键词或自然语言问题 / Search keyword or natural language question' },
+      max_results: { type: 'number', required: false, description: '返回结果条数，1-20，默认 8 / Number of results, 1-20, default 8' },
+      time_range: { type: 'string', required: false, description: '可选：day / week / month / year / Optional: day / week / month / year' },
     }),
     output: {
       schema: { type: 'string' },
@@ -327,11 +331,14 @@ function registerFetchTool(ctx) {
     description: [
       'Fetch a URL and return clean markdown text by round-robin calling Keenable / Exa / Tavily, with automatic failover.',
       'Use when you need the full text of a web page rather than just search summaries.',
+      '',
+      '中文：轮流调用 Keenable / Exa / Tavily 抓取网页正文并返回 clean markdown。',
+      '当你需要网页全文而不是搜索摘要时使用。',
     ].join('\n'),
     parameters: toJsonSchema({
-      url: { type: 'string', required: true, description: '要抓取的网页地址' },
-      max_chars: { type: 'number', required: false, description: '返回内容的最大字符数，默认 30000，上限 50000' },
-      live: { type: 'boolean', required: false, description: '是否实时从源站抓取（绕过索引/缓存），默认 false' },
+      url: { type: 'string', required: true, description: '要抓取的网页地址 / URL of the web page to fetch' },
+      max_chars: { type: 'number', required: false, description: '返回内容的最大字符数，默认 30000，上限 50000 / Maximum characters to return, default 30000, max 50000' },
+      live: { type: 'boolean', required: false, description: '是否实时从源站抓取（绕过索引/缓存），默认 false / Fetch live from the source (bypass index/cache), default false' },
     }),
     output: {
       schema: { type: 'string' },
