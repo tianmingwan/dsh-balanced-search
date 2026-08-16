@@ -1,0 +1,5 @@
+# dsh-balanced-search bundle layer.
+# Installed via `dsh plugin --profile web add github:tianmingwan/balanced-search`.
+- insert:
+    - id: balanced-search
+      name: dsh-balanced-search

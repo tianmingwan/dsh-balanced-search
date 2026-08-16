@@ -1,0 +1,36 @@
+{
+  "name": "dsh-balanced-search",
+  "version": "0.1.0",
+  "description": "Balanced web search for DeepSeek Harness: Keenable / Exa / Tavily round-robin search and fetch, with automatic failover.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "server.py",
+    "providers.py",
+    "requirements.txt",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "mcp",
+    "search",
+    "keenable",
+    "exa",
+    "tavily"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
