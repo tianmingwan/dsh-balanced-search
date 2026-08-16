@@ -44,7 +44,7 @@ dsh 原生插件直接读取进程环境变量；Python MCP 服务器还会自�
 要求：DeepSeek Harness（dsh）已安装，Node.js ≥ 20。
 
 ```sh
-dsh plugin --profile web add github:tianmingwan/balanced-search
+dsh plugin --profile web add github:tianmingwan/dsh-balanced-search
 ```
 
 重启 `dsh --profile web` 后，会话中会出现两个工具：

@@ -25,6 +25,10 @@
     "tavily"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tianmingwan/dsh-balanced-search.git"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
