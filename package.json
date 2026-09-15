@@ -1,7 +1,7 @@
 {
   "name": "dsh-balanced-search",
-  "version": "0.1.0",
-  "description": "Balanced web search for DeepSeek Harness: Keenable / Exa / Tavily round-robin search and fetch, with automatic failover.",
+  "version": "0.2.0",
+  "description": "Balanced web search for DeepSeek Harness: Keenable / Exa / Tavily round-robin search and fetch, with automatic failover. Registers balanced_search / balanced_fetch tools and takes over the built-in web_search / web_fetch.",
   "type": "module",
   "main": "index.js",
   "files": [
@@ -20,6 +20,9 @@
     "dsh",
     "mcp",
     "search",
+    "web-search",
+    "web-fetch",
+    "provider",
     "keenable",
     "exa",
     "tavily"

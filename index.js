@@ -1,10 +1,20 @@
 // dsh-balanced-search — native DeepSeek Harness plugin.
 //
-// Registers `balanced_search` and `balanced_fetch` tools that round-robin
-// across Keenable / Exa / Tavily, with automatic failover.
+// One provider pool serves two surfaces:
+//
+//   1. The `balanced_search` / `balanced_fetch` tools (registered below).
+//   2. A `ctx.web` seam provider with id `balanced`, so dsh's built-in
+//      `web_search` / `web_fetch` tools use the same round-robin pool.
+//      cordis.patch.yml pins the `web` row to this provider, so installing the
+//      bundle takes those two built-in tools over automatically.
 //
 // This file is the dsh-native entry. The repository also ships server.py /
 // providers.py so the same backend can be used as a standalone MCP server.
+//
+// Deliberately zero dependencies and no imports: the profile directory
+// ($DSH_HOME/profiles/<name>) does not resolve `@deepseek-ai/*` packages, so a
+// runtime import of the seam's types would fail there. Only Node globals
+// (fetch, AbortController) are used.
 
 export const name = 'dsh-balanced-search'
 export const inject = ['tools']
@@ -13,6 +23,21 @@ const TIME_RANGES = ['day', 'week', 'month', 'year']
 const DAYS_BY_RANGE = { day: 1, week: 7, month: 30, year: 365 }
 const KEENABLE_REL = { day: '1d', week: '7d', month: '1mo', year: '1y' }
 const HTTP_TIMEOUT_MS = 30_000
+
+const NO_KEY_MESSAGE =
+  '未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY）'
+
+/** Provider id registered into the `ctx.web` seam; the `web` row pins this value. */
+const WEB_PROVIDER_ID = 'balanced'
+
+/**
+ * Body cap handed to the vendor for seams fetches.
+ *
+ * The seam's `WebFetchRequest` carries only `url` — no `maxChars`/`live`
+ * (those are deployment policy there), so a fixed cap is used and
+ * `truncated` is inferred from whether the text reached it.
+ */
+const WEB_FETCH_MAX_CHARS = 30_000
 
 class ProviderError extends Error {}
 
@@ -207,12 +232,24 @@ class Balancer {
       throw new Error('至少需要一个 provider')
     }
     this.providers = providers
-    this.next = 0
+    // One cursor per capability, deliberately NOT shared: search and fetch are
+    // consumed at different rates, and a shared cursor makes the rotation
+    // collapse. With exactly two providers and an alternating
+    // search/fetch workload a single cursor pins every search to provider A and
+    // every fetch to provider B, defeating the round-robin entirely.
+    this.nextSearch = 0
+    this.nextFetch = 0
+  }
+
+  /** Claim the next starting index for one capability and advance its cursor. */
+  #take(cursor) {
+    const start = this[cursor]
+    this[cursor] = (this[cursor] + 1) % this.providers.length
+    return start
   }
 
   async search(query, maxResults, timeRange, signal) {
-    const start = this.next
-    this.next = (this.next + 1) % this.providers.length
+    const start = this.#take('nextSearch')
     const errors = []
     for (let offset = 0; offset < this.providers.length; offset++) {
       const provider = this.providers[(start + offset) % this.providers.length]
@@ -227,8 +264,7 @@ class Balancer {
   }
 
   async fetch(url, maxChars, live, signal) {
-    const start = this.next
-    this.next = (this.next + 1) % this.providers.length
+    const start = this.#take('nextFetch')
     const errors = []
     for (let offset = 0; offset < this.providers.length; offset++) {
       const provider = this.providers[(start + offset) % this.providers.length]
@@ -249,7 +285,7 @@ function buildBalancer(env = process.env) {
   if (env.EXA_API_KEY) providers.push(new ExaProvider(env.EXA_API_KEY))
   if (env.TAVILY_API_KEY) providers.push(new TavilyProvider(env.TAVILY_API_KEY))
   if (!providers.length) {
-    throw new Error('未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY）')
+    throw new Error(NO_KEY_MESSAGE)
   }
   return new Balancer(providers)
 }
@@ -259,6 +295,68 @@ let _balancer = null
 function getBalancer(env = process.env) {
   if (!_balancer) _balancer = buildBalancer(env)
   return _balancer
+}
+
+/**
+ * Cheap local availability check; never throws and never makes a network call.
+ *
+ * The seam calls `available()` on every provider selection, and a pinned
+ * provider that reports unavailable fails the call with
+ * `WEB_PROVIDER_CONFIGURED_UNAVAILABLE`, so this must stay trivial.
+ */
+function hasProviderKeys(env = process.env) {
+  return Boolean(env.KEENABLE_API_KEY || env.EXA_API_KEY || env.TAVILY_API_KEY)
+}
+
+/**
+ * The `ctx.web` seam provider (id {@link WEB_PROVIDER_ID}).
+ *
+ * Reuses the same {@link Balancer} as the two tools, so round-robin and
+ * failover semantics stay identical; only the request/result shapes differ.
+ * One instance is registered into both the search and the fetch registry —
+ * the seam keys each registry by `provider.id` independently, so sharing an
+ * object across the two capability kinds is fine.
+ *
+ * Mapping notes: the seam's search request carries only `query`/`maxResults`
+ * (recency controls are deferred there), so `timeRange` is always null, and the
+ * fetch request carries only `url`, so the body cap is the fixed
+ * {@link WEB_FETCH_MAX_CHARS}. `statusCode` is 200 because every vendor
+ * extracts server-side and does not expose the origin page's status.
+ */
+class BalancedWebProvider {
+  id = WEB_PROVIDER_ID
+
+  available() {
+    return hasProviderKeys()
+  }
+
+  async search(request, signal) {
+    const balancer = getBalancer()
+    const { results } = await balancer.search(request.query, request.maxResults ?? 8, null, signal)
+    return {
+      sources: results
+        .filter((item) => item?.url)
+        .map((item) => ({
+          url: item.url,
+          title: item.title || undefined,
+          snippet: item.content || undefined,
+          publishedAt: item.published_at || undefined,
+        })),
+      truncated: false,
+    }
+  }
+
+  async fetch(request, signal) {
+    const balancer = getBalancer()
+    const { result } = await balancer.fetch(request.url, WEB_FETCH_MAX_CHARS, false, signal)
+    const content = (result.content || '').trim()
+    return {
+      url: result.url || request.url,
+      statusCode: 200,
+      body: { kind: 'text', content },
+      truncated: content.length >= WEB_FETCH_MAX_CHARS,
+    }
+  }
 }
 
 /** Minimal JSON schema compiler for tool parameters (zero dependencies). */
@@ -370,4 +468,19 @@ function registerFetchTool(ctx) {
 export function apply(ctx) {
   registerSearchTool(ctx)
   registerFetchTool(ctx)
+
+  // Take over dsh's built-in `web_search` / `web_fetch` by contributing a
+  // `ctx.web` provider under WEB_PROVIDER_ID; cordis.patch.yml pins the `web`
+  // row's searchProvider/fetchProvider to that id.
+  //
+  // Written as a dynamic injection rather than an `inject` entry on purpose:
+  // Cordis' `inject` has no optional form (every listed service is required and
+  // gates the whole plugin), so a hard `web` dependency would keep this plugin
+  // PENDING — silently disabling the two tools above — in any composition that
+  // does not mount @deepseek-ai/dsh-web.
+  ctx.inject(['web'], (ctx) => {
+    const provider = new BalancedWebProvider()
+    ctx.web.registerSearchProvider(provider)
+    ctx.web.registerFetchProvider(provider)
+  })
 }

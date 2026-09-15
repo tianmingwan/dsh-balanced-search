@@ -1,5 +1,36 @@
 # dsh-balanced-search bundle layer.
 # Installed via `dsh plugin --profile web add github:tianmingwan/dsh-balanced-search`.
+#
+# This file is a *bundle* layer (declared by package.json's `dsh.bundle.patch`),
+# so it is composed on top of the bundles listed before it in the profile —
+# notably `@deepseek-ai/dsh-base`, which mounts the `web` row. That ordering is
+# what lets the override below take effect without any manual profile edit.
 - insert:
     - id: balanced-search
       name: dsh-balanced-search
+
+# Take over dsh's built-in `web_search` / `web_fetch`.
+#
+# `index.js` registers a `ctx.web` provider with id `balanced` (it serves both
+# the search and the fetch capability), so pinning the two provider ids here
+# routes the built-in tools through the Keenable / Exa / Tavily round-robin
+# pool instead of the shipped `deepseek-official` search and `http` fetch
+# backends.
+#
+# Two mechanics worth knowing:
+#
+#   * A patch replaces the targeted row's whole `config` rather than merging
+#     into it, so BOTH fields must be restated — omitting one would clear it.
+#   * A user's own cordis.patch.yml is applied after every bundle layer, so
+#     these two lines remain overridable (and removable) per profile.
+#
+# Requires at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY.
+# With none set the provider reports itself unavailable, and the built-in tools
+# fail with `WEB_PROVIDER_CONFIGURED_UNAVAILABLE` naming `balanced`; remove
+# these two lines to fall back to the shipped providers. The plugin's own
+# `balanced_search` / `balanced_fetch` tools are unaffected either way.
+- id: web
+  name: '@deepseek-ai/dsh-web'
+  config:
+    searchProvider: balanced
+    fetchProvider: balanced
