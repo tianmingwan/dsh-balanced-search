@@ -28,6 +28,15 @@ EXA_API_KEY=...
 TAVILY_API_KEY=...
 ```
 
+> 👉 **Where to register and get each key — sign-up links, where the key lives in each dashboard, free quotas, and what one call costs: [`API_KEYS.md`](API_KEYS.md).**
+> **三家的注册入口、key 在各家后台的哪个页面、免费额度、以及单次调用消耗，见 [`API_KEYS.md`](API_KEYS.md)。**
+
+| Provider | Sign up / 注册 | Env var | Free tier / 免费额度 |
+|---|---|---|---|
+| Keenable | <https://app.keenable.ai/login> | `KEENABLE_API_KEY` | 100,000 requests / month |
+| Exa | <https://dashboard.exa.ai/onboarding-guest> | `EXA_API_KEY` | $20 on sign-up + $10 / month |
+| Tavily | <https://app.tavily.com> | `TAVILY_API_KEY` | 1,000 credits / month |
+
 The dsh native plugin reads process environment variables directly. The Python MCP server also loads a `.env` file in the same directory. / dsh 原生插件直接读取进程环境变量；Python MCP 服务器还会自动读取同目录下的 `.env` 文件。
 
 ## Directory Structure / 目录结构
@@ -41,6 +50,7 @@ The dsh native plugin reads process environment variables directly. The Python M
 | `providers.py` | Python providers + round-robin / failover / Python 版 API 客户端与轮换 |
 | `requirements.txt` | Python MCP server dependencies / Python MCP 服务器依赖 |
 | `.env.example` | API key template (copy to `.env`) / API key 配置模板 |
+| `API_KEYS.md` | Where to register the three APIs and get keys / 三个 API 的注册与 key 领取说明 |
 | `.gitignore` | Excludes `.env`, virtualenvs, caches / 排除本地敏感与缓存文件 |
 
 ## Install as a dsh Plugin / 安装为 dsh 插件
