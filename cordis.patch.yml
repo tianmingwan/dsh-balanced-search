@@ -17,6 +17,11 @@
 # pool instead of the shipped `deepseek-official` search and `http` fetch
 # backends.
 #
+# This is the plugin's ONLY effect: it registers no tools of its own, so the
+# model keeps seeing exactly the built-in `web_search` / `web_fetch` — which is
+# what gives the takeover the official search card, globe icon and step wording
+# in the GUI.
+#
 # Two mechanics worth knowing:
 #
 #   * A patch replaces the targeted row's whole `config` rather than merging
@@ -26,9 +31,12 @@
 #
 # Requires at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY.
 # With none set the provider reports itself unavailable, and the built-in tools
-# fail with `WEB_PROVIDER_CONFIGURED_UNAVAILABLE` naming `balanced`; remove
-# these two lines to fall back to the shipped providers. The plugin's own
-# `balanced_search` / `balanced_fetch` tools are unaffected either way.
+# fail with `WEB_PROVIDER_CONFIGURED_UNAVAILABLE` naming `balanced` — there is
+# no fallback to the shipped providers. Remove these two lines to fall back.
+#
+# The GUI's web-search settings page also writes this row, switching it to
+# `deepseek-search-api` / `deepseek-fetch-api`. Those ids are not registered in
+# this composition, so saving that page would break web search outright.
 - id: web
   name: '@deepseek-ai/dsh-web'
   config:

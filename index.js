@@ -1,15 +1,23 @@
 // dsh-balanced-search — native DeepSeek Harness plugin.
 //
-// One provider pool serves two surfaces:
+// Two surfaces, one provider pool:
 //
-//   1. The `balanced_search` / `balanced_fetch` tools (registered below).
-//   2. A `ctx.web` seam provider with id `balanced`, so dsh's built-in
-//      `web_search` / `web_fetch` tools use the same round-robin pool.
-//      cordis.patch.yml pins the `web` row to this provider, so installing the
-//      bundle takes those two built-in tools over automatically.
+//   1. The `balanced_search` / `balanced_fetch` tools, for callers that want
+//      `time_range`, an explicit result count, or `max_chars`/`live` — the
+//      controls the seam does not carry.
+//   2. A `ctx.web` seam provider with id `balanced`, which takes over dsh's
+//      built-in `web_search` / `web_fetch` through cordis.patch.yml's pin.
 //
-// This file is the dsh-native entry. The repository also ships server.py /
-// providers.py so the same backend can be used as a standalone MCP server.
+// Both surfaces share one {@link Balancer}, so round-robin and failover behave
+// identically no matter which one is called.
+//
+// The GUI draws its search card, globe icon and step wording from the literal
+// tool names `web_search` / `web_fetch`, so those two keep the official look
+// via the seam. The two plugin-owned tools are given the same look by this
+// package's client half (lib/client.js), which claims their views through the
+// public `tool.call.toolview` slot and appends a "· balanced" suffix — see the
+// `dsh.client` declaration in package.json. `output.presentationMeta` feeds
+// that view the structured result (sources, provider, elapsed time).
 //
 // Deliberately zero dependencies and no imports: the profile directory
 // ($DSH_HOME/profiles/<name>) does not resolve `@deepseek-ai/*` packages, so a
@@ -22,7 +30,19 @@ export const inject = ['tools']
 const TIME_RANGES = ['day', 'week', 'month', 'year']
 const DAYS_BY_RANGE = { day: 1, week: 7, month: 30, year: 365 }
 const KEENABLE_REL = { day: '1d', week: '7d', month: '1mo', year: '1y' }
-const HTTP_TIMEOUT_MS = 30_000
+
+/**
+ * Per-request timeouts, split by capability and deliberately NOT shared.
+ *
+ * dsh's own tool layer allows a search far longer than a fetch
+ * (`searchTimeoutMs` 60000 vs the 30000 fetch default), and the vendors differ
+ * the same way: a search is a single fast index query, while an extraction
+ * (Tavily's advanced extract in particular) has a server-side 30s budget of its
+ * own. A 45s fetch budget therefore lets the Balancer fail over to a second
+ * vendor instead of dying on the first one's timeout.
+ */
+const SEARCH_TIMEOUT_MS = 20_000
+const FETCH_TIMEOUT_MS = 45_000
 
 const NO_KEY_MESSAGE =
   '未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY）'
@@ -31,13 +51,16 @@ const NO_KEY_MESSAGE =
 const WEB_PROVIDER_ID = 'balanced'
 
 /**
- * Body cap handed to the vendor for seams fetches.
+ * Body cap applied to seam fetches.
  *
  * The seam's `WebFetchRequest` carries only `url` — no `maxChars`/`live`
- * (those are deployment policy there), so a fixed cap is used and
- * `truncated` is inferred from whether the text reached it.
+ * (those are deployment policy there), so this fixed cap IS the deployment
+ * policy. 100_000 matches what dsh's shipped HTTP fetch provider hands the tool
+ * layer, so a takeover does not silently shorten fetched pages. It is passed to
+ * the vendors that accept one AND enforced locally on the way back, so
+ * `truncated` reports what was actually cut.
  */
-const WEB_FETCH_MAX_CHARS = 30_000
+const WEB_FETCH_MAX_CHARS = 100_000
 
 class ProviderError extends Error {}
 
@@ -50,7 +73,7 @@ function isoDaysAgo(days) {
 }
 
 async function requestJson(url, options = {}) {
-  const { timeoutMs = HTTP_TIMEOUT_MS, signal, ...rest } = options
+  const { timeoutMs = FETCH_TIMEOUT_MS, signal, ...rest } = options
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs)
   const onOuterAbort = () => controller.abort(signal?.reason)
@@ -82,14 +105,18 @@ class KeenableProvider {
     this.apiKey = apiKey
   }
 
-  async search(query, maxResults, timeRange, signal) {
-    const body = { query, mode: 'realtime' }
+  async search(query, maxResults, timeRange, signal, timeoutMs) {
+    // `max_results` is NOT optional in practice: left out, the endpoint applies
+    // its own default of 10, so an explicit 1-20 request would be silently
+    // ignored (Keenable SearchRequest: 1-50, default 10).
+    const body = { query, mode: 'realtime', max_results: maxResults }
     if (timeRange) body.published_after = KEENABLE_REL[timeRange]
     const data = await requestJson('https://api.keenable.ai/v1/search', {
       method: 'POST',
       headers: { 'X-API-Key': this.apiKey, 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      timeoutMs,
     })
     return (data.results || []).map((item) => ({
       title: item.title || '',
@@ -100,13 +127,14 @@ class KeenableProvider {
     }))
   }
 
-  async fetch(url, maxChars, live, signal) {
+  async fetch(url, maxChars, live, signal, timeoutMs) {
     const params = new URLSearchParams({ url })
     if (maxChars) params.set('max_chars', String(maxChars))
     if (live) params.set('live', 'true')
     const data = await requestJson(`https://api.keenable.ai/v1/fetch?${params}`, {
       headers: { 'X-API-Key': this.apiKey },
       signal,
+      timeoutMs,
     })
     return {
       url: data.url || url,
@@ -123,12 +151,17 @@ class ExaProvider {
     this.apiKey = apiKey
   }
 
-  async search(query, maxResults, timeRange, signal) {
+  async search(query, maxResults, timeRange, signal, timeoutMs) {
+    // `type: 'auto'` is Exa's own default and their documented recommendation.
+    // `contents.title` is NOT a member of the current ContentsOptions (title
+    // arrives on the result itself), so sending it was noise at best; the text
+    // budget is trimmed to 2000 because sources are rendered as card snippets,
+    // not read whole.
     const body = {
       query,
       type: 'auto',
       numResults: maxResults,
-      contents: { text: { maxCharacters: 3000 }, title: true },
+      contents: { text: { maxCharacters: 2000 } },
     }
     if (timeRange) body.startPublishedDate = isoDaysAgo(DAYS_BY_RANGE[timeRange])
     const data = await requestJson('https://api.exa.ai/search', {
@@ -136,6 +169,7 @@ class ExaProvider {
       headers: { 'x-api-key': this.apiKey, 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      timeoutMs,
     })
     return (data.results || []).map((item) => ({
       title: item.title || '',
@@ -146,7 +180,7 @@ class ExaProvider {
     }))
   }
 
-  async fetch(url, maxChars, live, signal) {
+  async fetch(url, maxChars, live, signal, timeoutMs) {
     const body = {
       urls: [url],
       text: { maxCharacters: maxChars || 30_000 },
@@ -157,6 +191,7 @@ class ExaProvider {
       headers: { 'x-api-key': this.apiKey, 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      timeoutMs,
     })
     const results = data.results || []
     const item = results.find((r) => r.url === url || r.id === url) || results[0]
@@ -176,7 +211,10 @@ class TavilyProvider {
     this.apiKey = apiKey
   }
 
-  async search(query, maxResults, timeRange, signal) {
+  async search(query, maxResults, timeRange, signal, timeoutMs) {
+    // `search_depth: 'advanced'` costs 2 credits per call against 1 for
+    // 'basic'; the Balancer spreads calls over three vendors, so the extra
+    // depth is affordable and materially better for research-shaped queries.
     const body = {
       query,
       search_depth: 'advanced',
@@ -188,6 +226,7 @@ class TavilyProvider {
       headers: { Authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      timeoutMs,
     })
     return (data.results || []).map((item) => ({
       title: item.title || '',
@@ -198,7 +237,7 @@ class TavilyProvider {
     }))
   }
 
-  async fetch(url, maxChars, live, signal) {
+  async fetch(url, maxChars, live, signal, timeoutMs) {
     const body = {
       urls: [url],
       extract_depth: 'advanced',
@@ -209,6 +248,7 @@ class TavilyProvider {
       headers: { Authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal,
+      timeoutMs,
     })
     const results = data.results || []
     if (results.length === 0) {
@@ -217,10 +257,14 @@ class TavilyProvider {
       throw new ProviderError(`tavily 抓取失败: ${err}`)
     }
     const item = results[0]
+    // Tavily's extract API exposes no output-length control, so the cap has to
+    // be applied here. Without it the seam receives far more text than it asked
+    // for, and the caller's own truncation bookkeeping would be wrong.
+    const raw = (item.raw_content || '').trim()
     return {
       url: item.url || url,
       title: item.title || '',
-      content: (item.raw_content || '').trim(),
+      content: maxChars && raw.length > maxChars ? raw.slice(0, maxChars) : raw,
       provider: this.name,
     }
   }
@@ -254,7 +298,7 @@ class Balancer {
     for (let offset = 0; offset < this.providers.length; offset++) {
       const provider = this.providers[(start + offset) % this.providers.length]
       try {
-        const results = await provider.search(query, maxResults, timeRange, signal)
+        const results = await provider.search(query, maxResults, timeRange, signal, SEARCH_TIMEOUT_MS)
         return { provider: provider.name, results: results.slice(0, maxResults) }
       } catch (error) {
         errors.push(`${provider.name}: ${error?.message || error}`)
@@ -269,7 +313,7 @@ class Balancer {
     for (let offset = 0; offset < this.providers.length; offset++) {
       const provider = this.providers[(start + offset) % this.providers.length]
       try {
-        const result = await provider.fetch(url, maxChars, live, signal)
+        const result = await provider.fetch(url, maxChars, live, signal, FETCH_TIMEOUT_MS)
         return { provider: provider.name, result }
       } catch (error) {
         errors.push(`${provider.name}: ${error?.message || error}`)
@@ -292,6 +336,12 @@ function buildBalancer(env = process.env) {
 
 let _balancer = null
 
+/**
+ * The pool, built once and cached.
+ *
+ * Keys are therefore read once per process: adding or rotating a key needs a
+ * restart, which is also what the profile's `.env` load implies.
+ */
 function getBalancer(env = process.env) {
   if (!_balancer) _balancer = buildBalancer(env)
   return _balancer
@@ -311,17 +361,12 @@ function hasProviderKeys(env = process.env) {
 /**
  * The `ctx.web` seam provider (id {@link WEB_PROVIDER_ID}).
  *
- * Reuses the same {@link Balancer} as the two tools, so round-robin and
- * failover semantics stay identical; only the request/result shapes differ.
- * One instance is registered into both the search and the fetch registry —
- * the seam keys each registry by `provider.id` independently, so sharing an
- * object across the two capability kinds is fine.
+ * One instance is registered into BOTH the search and the fetch registry: the
+ * seam keys each registry by `provider.id` independently, so sharing an object
+ * across the two capability kinds is fine.
  *
  * Mapping notes: the seam's search request carries only `query`/`maxResults`
- * (recency controls are deferred there), so `timeRange` is always null, and the
- * fetch request carries only `url`, so the body cap is the fixed
- * {@link WEB_FETCH_MAX_CHARS}. `statusCode` is 200 because every vendor
- * extracts server-side and does not expose the origin page's status.
+ * (recency controls are deferred there), so `timeRange` is always null.
  */
 class BalancedWebProvider {
   id = WEB_PROVIDER_ID
@@ -348,13 +393,23 @@ class BalancedWebProvider {
 
   async fetch(request, signal) {
     const balancer = getBalancer()
+    // `live=false` is deliberate deployment policy: a WebFetchRequest carries
+    // only `url`, and serving from the vendor index keeps latency down. Switch
+    // this to `true` to force an origin fetch (Keenable `live=true`, Exa
+    // `maxAgeHours=0`; Tavily's extract API has no equivalent control).
     const { result } = await balancer.fetch(request.url, WEB_FETCH_MAX_CHARS, false, signal)
-    const content = (result.content || '').trim()
+    const raw = (result.content || '').trim()
+    // Enforce the cap here as well: a vendor that ignores `maxChars` must not
+    // make `truncated` lie.
+    const content = raw.length > WEB_FETCH_MAX_CHARS ? raw.slice(0, WEB_FETCH_MAX_CHARS) : raw
     return {
       url: result.url || request.url,
+      // Every vendor extracts server-side and never exposes the origin page's
+      // status, so a successful extraction reports 200. A 403/404 at the origin
+      // is indistinguishable here and will read as HTTP 200 to the model.
       statusCode: 200,
       body: { kind: 'text', content },
-      truncated: content.length >= WEB_FETCH_MAX_CHARS,
+      truncated: raw.length > WEB_FETCH_MAX_CHARS,
     }
   }
 }
@@ -372,16 +427,73 @@ function toJsonSchema(spec) {
   return { type: 'object', properties, required, additionalProperties: false }
 }
 
+/**
+ * Structured meta for lib/client.js, which draws the tool card from it.
+ *
+ * The registry deep-freezes the result and requires losslessly serializable
+ * JSON, so every field is always present — no `undefined`, which would drop the
+ * key and leave the view branching on a missing member.
+ */
+function searchMeta(args, value) {
+  const queries = [String(args?.query ?? '')]
+  try {
+    const parsed = JSON.parse(String(value))
+    return {
+      balanced: true,
+      kind: 'search',
+      queries,
+      provider: typeof parsed?.provider === 'string' ? parsed.provider : '',
+      elapsedMs: Number.isFinite(parsed?.elapsed_ms) ? parsed.elapsed_ms : 0,
+      count: Number.isFinite(parsed?.count) ? parsed.count : 0,
+      truncated: parsed?.truncated === true,
+      sources: Array.isArray(parsed?.results)
+        ? parsed.results.map((item) => ({
+            title: String(item?.title ?? ''),
+            url: String(item?.url ?? ''),
+            snippet: String(item?.content ?? ''),
+          }))
+        : [],
+      error: typeof parsed?.error === 'string' ? parsed.error : '',
+    }
+  } catch {
+    return { balanced: true, kind: 'search', queries, provider: '', elapsedMs: 0, count: 0, truncated: false, sources: [], error: '' }
+  }
+}
+
+function fetchMeta(args, value) {
+  const url = String(args?.url ?? '')
+  try {
+    const parsed = JSON.parse(String(value))
+    const result = parsed?.result ?? {}
+    const content = typeof result?.content === 'string' ? result.content : ''
+    return {
+      balanced: true,
+      kind: 'fetch',
+      url: typeof result?.url === 'string' && result.url ? result.url : url,
+      provider: typeof parsed?.provider === 'string' ? parsed.provider : '',
+      elapsedMs: Number.isFinite(parsed?.elapsed_ms) ? parsed.elapsed_ms : 0,
+      statusCode: 200,
+      length: content.length,
+      truncated: false,
+      error: typeof parsed?.error === 'string' ? parsed.error : '',
+    }
+  } catch {
+    return { balanced: true, kind: 'fetch', url, provider: '', elapsedMs: 0, statusCode: 0, length: 0, truncated: false, error: '' }
+  }
+}
+
 function registerSearchTool(ctx) {
   ctx.tools.register({
     name: 'balanced_search',
     description: [
-      'Search the web by round-robin calling Keenable / Exa / Tavily, with automatic failover.',
-      'Use when the current task needs current web information, links, or content summaries.',
+      'Search the web through a Keenable / Exa / Tavily round-robin pool with automatic failover.',
+      'Use for current web information, links, or content summaries; supports a recency window.',
+      'Prefer a single call: issue one query per call and do not fan out several searches in parallel — each query is a separate vendor request.',
       'Configure at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY in the environment.',
       '',
       '中文：轮流调用 Keenable / Exa / Tavily 搜索网页，自动故障切换。',
-      '当需要最新网页信息、链接或内容摘要时使用。',
+      '当需要最新网页信息、链接或内容摘要时使用，支持时间范围过滤。',
+      '建议一次只发一个查询，不要并行发起多个搜索——每个查询都是一次独立的厂商调用。',
       '需要配置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY 中的至少一个。',
     ].join('\n'),
     parameters: toJsonSchema({
@@ -392,7 +504,9 @@ function registerSearchTool(ctx) {
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
+      presentationMeta: searchMeta,
     },
+    timeoutMs: 60_000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const query = String(args?.query ?? '').trim()
@@ -410,12 +524,14 @@ function registerSearchTool(ctx) {
         return json({ error: `time_range 必须是 ${TIME_RANGES.join(' / ')} 之一`, results: [] })
       }
 
+      const startedAt = Date.now()
       try {
         const { provider, results } = await getBalancer().search(query, maxResults, timeRange, exec?.signal)
-        return json({ provider, count: results.length, results })
+        return json({ provider, count: results.length, elapsed_ms: Date.now() - startedAt, truncated: false, results })
       } catch (error) {
         return json({
           error: error instanceof ProviderError ? error.message : `内部错误: ${error?.message || error}`,
+          elapsed_ms: Date.now() - startedAt,
           results: [],
         })
       }
@@ -427,11 +543,12 @@ function registerFetchTool(ctx) {
   ctx.tools.register({
     name: 'balanced_fetch',
     description: [
-      'Fetch a URL and return clean markdown text by round-robin calling Keenable / Exa / Tavily, with automatic failover.',
+      'Fetch a URL and return clean markdown text through the same Keenable / Exa / Tavily round-robin pool, with automatic failover.',
       'Use when you need the full text of a web page rather than just search summaries.',
+      'Prefer a single call: one URL per call.',
       '',
       '中文：轮流调用 Keenable / Exa / Tavily 抓取网页正文并返回 clean markdown。',
-      '当你需要网页全文而不是搜索摘要时使用。',
+      '当你需要网页全文而不是搜索摘要时使用，建议一次只抓一个 URL。',
     ].join('\n'),
     parameters: toJsonSchema({
       url: { type: 'string', required: true, description: '要抓取的网页地址 / URL of the web page to fetch' },
@@ -441,7 +558,9 @@ function registerFetchTool(ctx) {
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
+      presentationMeta: fetchMeta,
     },
+    timeoutMs: 60_000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const url = String(args?.url ?? '').trim()
@@ -455,29 +574,34 @@ function registerFetchTool(ctx) {
       }
 
       const live = Boolean(args?.live)
+      const startedAt = Date.now()
       try {
         const { provider, result } = await getBalancer().fetch(url, maxChars, live, exec?.signal)
-        return json({ provider, result })
+        return json({ provider, elapsed_ms: Date.now() - startedAt, result })
       } catch (error) {
-        return json({ error: error instanceof ProviderError ? error.message : `内部错误: ${error?.message || error}` })
+        return json({
+          error: error instanceof ProviderError ? error.message : `内部错误: ${error?.message || error}`,
+          elapsed_ms: Date.now() - startedAt,
+        })
       }
     },
   })
 }
 
 export function apply(ctx) {
+  // Surface 1: the two plugin-owned tools.
   registerSearchTool(ctx)
   registerFetchTool(ctx)
 
-  // Take over dsh's built-in `web_search` / `web_fetch` by contributing a
-  // `ctx.web` provider under WEB_PROVIDER_ID; cordis.patch.yml pins the `web`
-  // row's searchProvider/fetchProvider to that id.
+  // Surface 2: the seam provider that takes over dsh's built-in
+  // `web_search` / `web_fetch`. cordis.patch.yml pins the `web` row's
+  // searchProvider/fetchProvider to WEB_PROVIDER_ID.
   //
   // Written as a dynamic injection rather than an `inject` entry on purpose:
   // Cordis' `inject` has no optional form (every listed service is required and
-  // gates the whole plugin), so a hard `web` dependency would keep this plugin
-  // PENDING — silently disabling the two tools above — in any composition that
-  // does not mount @deepseek-ai/dsh-web.
+  // gates the whole plugin), so a hard `web` dependency would keep the provider
+  // registration PENDING in any composition that does not mount
+  // @deepseek-ai/dsh-web.
   ctx.inject(['web'], (ctx) => {
     const provider = new BalancedWebProvider()
     ctx.web.registerSearchProvider(provider)
