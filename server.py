@@ -1,13 +1,11 @@
-"""balanced-search MCP server — 轮流调用五个搜索后端（Keenable / Exa / Tavily /
-Firecrawl / Bright Data）。
+"""balanced-search MCP server — 轮流调用四个搜索后端（Keenable / Exa / Tavily /
+Firecrawl）。
 
 用法:
     python server.py            # stdio 模式，供 MCP 客户端（如 ZCode）连接
 
 环境变量（至少配置一个，未配置的后端会被跳过）:
-    KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY /
-    BRIGHTDATA_API_TOKEN（或别名 BRIGHTDATA_API_KEY）；
-    可选 BRIGHTDATA_MCP_URL 覆盖 Bright Data 的 MCP 端点。
+    KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY
 也可在同目录 .env 文件中配置（本地测试用）。
 """
 from __future__ import annotations
@@ -45,9 +43,8 @@ def _get_balancer():
 def search(query: str, max_results: int = 8, time_range: Optional[str] = None) -> str:
     """搜索网页，返回标题、链接和内容摘要。
 
-    五个搜索服务（Keenable / Exa / Tavily / Firecrawl / Bright Data）轮流调用，某个服务
-    失败时自动切换下一个。用于替代内置 WebSearch/WebFetch 的联网搜索场景。
-    Bright Data 不支持按时间过滤，带 time_range 时会被自动跳过、转给其他服务。
+    四个搜索服务（Keenable / Exa / Tavily / Firecrawl）轮流调用，某个服务失败时自动
+    切换下一个。用于替代内置 WebSearch/WebFetch 的联网搜索场景。
 
     Args:
         query: 搜索关键词或自然语言问题。
@@ -89,10 +86,9 @@ def search(query: str, max_results: int = 8, time_range: Optional[str] = None) -
 def fetch(url: str, max_chars: int = 30000, live: bool = False) -> str:
     """抓取指定 URL 的网页正文，返回 clean markdown 文本。
 
-    五个服务（Keenable / Exa / Tavily / Firecrawl / Bright Data）轮流调用，某个服务失败
-    时自动切换下一个。Keenable 默认只支持其索引内的 URL，传 live=true 可直接从源站抓取
-    （含未索引 URL）。Firecrawl 还会附带原页面的 status_code；Bright Data 走反爬代理，
-    最慢但能抓到普通 HTTP 客户端会被拦的站点。
+    四个服务（Keenable / Exa / Tavily / Firecrawl）轮流调用，某个服务失败时自动切换
+    下一个。Keenable 默认只支持其索引内的 URL，传 live=true 可直接从源站抓取（含未索引
+    URL）。Firecrawl 还会附带原页面的 status_code。
 
     Args:
         url: 要抓取的网页地址。

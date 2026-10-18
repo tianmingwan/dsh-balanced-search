@@ -13,9 +13,9 @@
 #
 # `index.js` registers a `ctx.web` provider with id `balanced` (it serves both
 # the search and the fetch capability), so pinning the two provider ids here
-# routes the built-in tools through the Keenable / Exa / Tavily / Firecrawl /
-# Bright Data round-robin pool instead of the shipped `deepseek-official` search
-# and `http` fetch backends.
+# routes the built-in tools through the Keenable / Exa / Tavily / Firecrawl
+# round-robin pool instead of the shipped `deepseek-official` search and `http`
+# fetch backends.
 #
 # This is the plugin's ONLY effect: it registers no tools of its own, so the
 # model keeps seeing exactly the built-in `web_search` / `web_fetch` — which is
@@ -30,8 +30,8 @@
 #     these two lines remain overridable (and removable) per profile.
 #
 # Requires at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY /
-# FIRECRAWL_API_KEY / BRIGHTDATA_API_TOKEN. With none set the provider reports
-# itself unavailable, and the built-in tools fail with
+# FIRECRAWL_API_KEY. With none set the provider reports itself unavailable, and
+# the built-in tools fail with
 # `WEB_PROVIDER_CONFIGURED_UNAVAILABLE` naming `balanced` — there is no fallback
 # to the shipped providers. Remove these two lines to fall back.
 #

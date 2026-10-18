@@ -1,7 +1,7 @@
 {
   "name": "dsh-balanced-search",
-  "version": "0.3.0",
-  "description": "Balanced web search for DeepSeek Harness: Keenable / Exa / Tavily / Firecrawl / Bright Data round-robin search and fetch with automatic failover. Registers balanced_search / balanced_fetch as dsh tools, takes the built-in web_search / web_fetch over through the ctx.web seam, and renders the two tools with an official-style card (plus a 'balanced' suffix) from a client half.",
+  "version": "0.4.0",
+  "description": "Balanced web search for DeepSeek Harness: Keenable / Exa / Tavily / Firecrawl round-robin search and fetch with automatic failover. Registers balanced_search / balanced_fetch as dsh tools, takes the built-in web_search / web_fetch over through the ctx.web seam, and renders the two tools with an official-style card (plus a 'balanced' suffix) from a client half.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -32,8 +32,7 @@
     "keenable",
     "exa",
     "tavily",
-    "firecrawl",
-    "bright-data"
+    "firecrawl"
   ],
   "license": "MIT",
   "repository": {

@@ -42,38 +42,12 @@ const FIRECRAWL_TBS = { day: 'qdr:d', week: 'qdr:w', month: 'qdr:m', year: 'qdr:
  * (Tavily's advanced extract in particular) has a server-side 30s budget of its
  * own. A 45s fetch budget therefore lets the Balancer fail over to a second
  * vendor instead of dying on the first one's timeout.
- *
- * A provider may override either budget by exposing `searchTimeoutMs` /
- * `fetchTimeoutMs`; `undefined` falls back to the values below.
  */
 const SEARCH_TIMEOUT_MS = 20_000
 const FETCH_TIMEOUT_MS = 45_000
 
-/**
- * Bright Data needs its own, longer budgets.
- *
- * Both of its tools are remote-proxy jobs rather than index lookups and their
- * latency is volatile: Google SERP scrapes measured 2.7–27s across calls (and
- * under contention, three parallel calls took 3.6/26/27s), page scrapes around
- * 17s, and `initialize` alone ~1s. The generic 20s search budget would time the
- * vendor out on a sizeable share of its turns and fail over anyway.
- *
- * Both budgets assume the plugin's OWN tools, which allow a call 60s: a provider
- * budget below the tool budget is what leaves the Balancer room to abandon a
- * slow vendor and still reach the next one.
- *
- * The takeover path is different and worth knowing about: dsh's built-in
- * `web_search` / `web_fetch` enforce their own `timeoutMs` (dsh defaults to 30s
- * when the profile does not set it), so a single slow Bright Data call there can
- * consume the whole budget and surface as TOOL_TIMEOUT instead of failing over.
- * A profile that wants the same headroom on that path has to raise
- * `fetchTimeoutMs` on its `tool-web` row.
- */
-const BRIGHTDATA_SEARCH_TIMEOUT_MS = 40_000
-const BRIGHTDATA_FETCH_TIMEOUT_MS = 45_000
-
 const NO_KEY_MESSAGE =
-  '未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / BRIGHTDATA_API_TOKEN）'
+  '未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY）'
 
 /** Provider id registered into the `ctx.web` seam; the `web` row pins this value. */
 const WEB_PROVIDER_ID = 'balanced'
@@ -103,21 +77,15 @@ function isoDaysAgo(days) {
 /**
  * One request with its own timeout, abort wiring and error normalisation.
  *
- * The response BODY is always read inside the guarded window. That matters for
- * the raw branch Bright Data uses: a `Response` handed back to the caller would
- * be read after `finally` had already torn this timer down and removed the
- * outer abort listener, so a server that sends headers and then streams (or
- * stalls) the body would leave the read unbounded — and dsh's tool timeout
- * policy awaits the handler rather than abandoning it, so a stalled body would
- * hang the whole tool call instead of failing over.
- *
- * Raw callers therefore get `{ response, text }`: the headers (the
- * `mcp-session-id` lives there) plus the already-read body, so SSE frames can
- * be parsed without touching the network again. `parse: 'json'` is what every
- * REST provider uses.
+ * The response BODY is read inside the guarded window, not handed back as a
+ * `Response`: a body read that happened after `finally` had already torn this
+ * timer down and removed the outer abort listener would be unbounded, and dsh's
+ * tool timeout policy awaits the handler rather than abandoning it — so a
+ * server that sent headers and then stalled the body would hang the whole tool
+ * call instead of failing over.
  */
-async function requestRaw(url, options = {}) {
-  const { timeoutMs = FETCH_TIMEOUT_MS, signal, parse, ...rest } = options
+async function requestJson(url, options = {}) {
+  const { timeoutMs = FETCH_TIMEOUT_MS, signal, ...rest } = options
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs)
   const onOuterAbort = () => controller.abort(signal?.reason)
@@ -127,19 +95,15 @@ async function requestRaw(url, options = {}) {
   }
   try {
     const response = await fetch(url, { ...rest, signal: controller.signal })
+    const text = await response.text()
     if (!response.ok) {
-      const text = await response.text().catch(() => '')
       throw new ProviderError(`HTTP ${response.status}: ${text.slice(0, 200)}`)
     }
-    const text = await response.text()
-    if (parse === 'json') {
-      try {
-        return JSON.parse(text)
-      } catch {
-        throw new ProviderError(`响应不是合法 JSON: ${text.slice(0, 200)}`)
-      }
+    try {
+      return JSON.parse(text)
+    } catch {
+      throw new ProviderError(`响应不是合法 JSON: ${text.slice(0, 200)}`)
     }
-    return { response, text }
   } catch (error) {
     if (error?.name === 'AbortError') {
       throw new ProviderError(`请求超时（${timeoutMs}ms）`)
@@ -149,10 +113,6 @@ async function requestRaw(url, options = {}) {
     clearTimeout(timer)
     if (signal) signal.removeEventListener('abort', onOuterAbort)
   }
-}
-
-async function requestJson(url, options = {}) {
-  return requestRaw(url, { ...options, parse: 'json' })
 }
 
 class KeenableProvider {
@@ -411,262 +371,6 @@ class FirecrawlProvider {
     }
   }
 }
-
-/**
- * Bright Data MCP — a hosted MCP server over Streamable HTTP, not a REST API.
- *
- * The endpoint is `https://mcp.brightdata.com/mcp?token=<api token>` and it
- * speaks JSON-RPC: `initialize` → `notifications/initialized` → `tools/call`.
- * This plugin only borrowed two of its 69 tools:
- *   * `search_engine` — Google/Bing/Yandex SERP scraping;
- *   * `scrape_as_markdown` — a page as markdown through the unblocking
- *     infrastructure, which is why it is slow (measured ~17s) but succeeds on
- *     sites that block ordinary HTTP clients.
- *
- * Practical consequences encoded below:
- *   * Both tools are proxy jobs, not index lookups, so this provider carries
- *     its own longer timeouts (`searchTimeoutMs` / `fetchTimeoutMs`).
- *   * The `tools/call` result text is wrapped in a security notice and
- *     `=====UNTRUSTED_<id>_BEGIN/END=====` markers by the server. The markers
- *     are part of the wire format, so they must be stripped before the JSON
- *     (search) or the markdown (fetch) can be read.
- *   * The `Mcp-Session-Id` header is returned by `initialize`; every later call
- *     must echo it. Sessions expire, so one transparent re-initialisation is
- *     attempted before failing over. All calls are serialized: a session is
- *     one conversation and interleaved initialisations would race.
- *
- * Deliberately NOT used: `search_engine` takes no date filter. A request with a
- * `time_range` therefore declines (`skipSearch`) instead of spending 5s on a
- * search that cannot honour it, and the Balancer moves on to the next vendor.
- */
-class BrightDataProvider {
-  name = 'brightdata'
-  searchTimeoutMs = BRIGHTDATA_SEARCH_TIMEOUT_MS
-  fetchTimeoutMs = BRIGHTDATA_FETCH_TIMEOUT_MS
-
-  constructor(token, endpoint) {
-    this.token = token
-    this.endpoint = endpoint || 'https://mcp.brightdata.com/mcp'
-    this.sessionId = null
-    this.nextId = 1
-    this.queue = Promise.resolve()
-  }
-
-  skipSearch(timeRange) {
-    return timeRange ? '不支持按时间范围过滤，已跳过' : null
-  }
-
-  /** Serialize every call: one session, one conversation at a time. */
-  #serial(work) {
-    const run = this.queue.then(work, work)
-    // Keep the chain alive regardless of this call's outcome.
-    this.queue = run.then(() => {}, () => {})
-    return run
-  }
-
-  #url() {
-    const url = new URL(this.endpoint)
-    url.searchParams.set('token', this.token)
-    return url.toString()
-  }
-
-  #headers() {
-    const headers = {
-      'content-type': 'application/json',
-      // The server rejects the request with 406 unless BOTH are advertised;
-      // it answers with SSE even when the client would have taken plain JSON.
-      accept: 'application/json, text/event-stream',
-    }
-    if (this.sessionId) headers['mcp-session-id'] = this.sessionId
-    return headers
-  }
-
-  /**
-   * One JSON-RPC round trip.
-   *
-   * The reply comes back as `{ response, text }` from `requestRaw`, which reads
-   * the whole body inside the request's own timeout window — so a server that
-   * sends headers first and streams the body cannot outlive the budget. The
-   * session header lives on the response, and SSE frames are ordinary
-   * `event: message` + `data: {jsonrpc}` pairs whose last `data:` payload is
-   * the reply. A notification (no id) answers 202 with an empty body.
-   */
-  async #rpc(payload, timeoutMs, signal) {
-    const { response, text } = await requestRaw(this.#url(), {
-      method: 'POST',
-      headers: this.#headers(),
-      body: JSON.stringify(payload),
-      signal,
-      timeoutMs,
-    })
-    const sessionId = response.headers.get('mcp-session-id')
-    if (sessionId) this.sessionId = sessionId
-    if (text.trim() === '') return null
-    const contentType = response.headers.get('content-type') || ''
-    if (contentType.includes('text/event-stream')) {
-      let last = null
-      for (const line of text.split('\n')) {
-        if (!line.startsWith('data:')) continue
-        const raw = line.slice(5).trim()
-        if (raw === '') continue
-        try {
-          last = JSON.parse(raw)
-        } catch {
-          // A malformed frame is ignored; if no frame parses, the caller's
-          // missing-result path reports the failure instead of a half-parsed
-          // reply being mistaken for success.
-        }
-      }
-      return last
-    }
-    try {
-      return JSON.parse(text)
-    } catch {
-      throw new ProviderError(`brightdata 响应不是 JSON: ${text.slice(0, 200)}`)
-    }
-  }
-
-  /** Send a JSON-RPC notification: no `id`, so nothing is awaited back. */
-  async #notify(method, params, timeoutMs, signal) {
-    await this.#rpc({ jsonrpc: '2.0', method, params }, timeoutMs, signal)
-  }
-
-  async #send(method, params, timeoutMs, signal) {
-    const reply = await this.#rpc(
-      { jsonrpc: '2.0', id: this.nextId++, method, params },
-      timeoutMs,
-      signal,
-    )
-    if (reply?.error) {
-      throw new ProviderError(`brightdata ${method} 失败: ${reply.error.message || 'unknown'}`)
-    }
-    if (reply === null) {
-      throw new ProviderError(`brightdata ${method} 无响应`)
-    }
-    return reply.result
-  }
-
-  async #initialize(timeoutMs, signal) {
-    const result = await this.#send(
-      'initialize',
-      {
-        // The version the server advertises. It also accepts older revisions,
-        // but this is the one its own serverInfo reports.
-        protocolVersion: '2025-06-18',
-        capabilities: {},
-        clientInfo: { name: 'dsh-balanced-search', version: '0.3.0' },
-      },
-      timeoutMs,
-      signal,
-    )
-    // Required by the spec before any tools/call: the server treats the session
-    // as usable only once this notification arrives. The reply is a 202 with no
-    // body, and a failure here must not abort the call — the tools/call that
-    // follows reports the real problem.
-    await this.#notify('notifications/initialized', undefined, timeoutMs, signal).catch(() => {})
-    return result
-  }
-
-  /**
-   * Run a tool, re-initialising once when the session has expired.
-   *
-   * An expired session shows up as an HTTP 4xx on `tools/call` (or as a
-   * JSON-RPC error when the transport still answers 200). Retrying once is
-   * safe for both tools used here: they are read-only.
-   */
-  async #callTool(name, args, timeoutMs, signal) {
-    return this.#serial(async () => {
-      const run = async () => {
-        if (!this.sessionId) await this.#initialize(timeoutMs, signal)
-        const result = await this.#send('tools/call', { name, arguments: args }, timeoutMs, signal)
-        if (result?.isError) {
-          throw new ProviderError(`brightdata ${name} 失败: ${toolText(result).slice(0, 200)}`)
-        }
-        return result
-      }
-      try {
-        return await run()
-      } catch (error) {
-        if (this.sessionId && isSessionError(error)) {
-          this.sessionId = null
-          return await run()
-        }
-        throw error
-      }
-    })
-  }
-
-  async search(query, maxResults, timeRange, signal, timeoutMs) {
-    if (timeRange) throw new ProviderError('brightdata 搜索不支持 time_range')
-    const result = await this.#callTool(
-      'search_engine',
-      { query, engine: 'google' },
-      timeoutMs,
-      signal,
-    )
-    const payload = unwrapUntrusted(toolText(result))
-    let parsed
-    try {
-      parsed = JSON.parse(payload)
-    } catch {
-      throw new ProviderError(`brightdata 搜索结果不是 JSON: ${payload.slice(0, 200)}`)
-    }
-    const organic = Array.isArray(parsed?.organic) ? parsed.organic : []
-    return organic.map((item) => ({
-      title: item.title || '',
-      url: item.link || '',
-      content: String(item.description ?? '').trim(),
-      provider: this.name,
-    }))
-  }
-
-  async fetch(url, maxChars, live, signal, timeoutMs) {
-    const result = await this.#callTool('scrape_as_markdown', { url }, timeoutMs, signal)
-    const raw = unwrapUntrusted(toolText(result)).trim()
-    if (raw === '') throw new ProviderError('brightdata 抓取返回空正文')
-    return {
-      // The tool returns markdown only, without the final URL or the page
-      // status; report the requested URL and leave statusCode undefined so the
-      // seam does not receive a fabricated 200.
-      url,
-      title: '',
-      content: maxChars && raw.length > maxChars ? raw.slice(0, maxChars) : raw,
-      provider: this.name,
-    }
-  }
-}
-
-/** The text of an MCP tool result; the two tools used here answer one text part. */
-function toolText(result) {
-  const parts = Array.isArray(result?.content) ? result.content : []
-  return parts
-    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text)
-    .join('\n')
-}
-
-/**
- * Strip Bright Data's untrusted-content wrapper from a tool result.
- *
- * The server encloses every fetched payload between
- * `=====UNTRUSTED_<id>_BEGIN=====` and `=====UNTRUSTED_<id>_END=====` and
- * prefixes a security notice. Both markers carry the same per-response id; the
- * notice text itself is not data and must not reach the model. When the
- * markers are absent (an error path, or a future response shape), the text is
- * returned unchanged — callers then fail on parsing it, which is the honest
- * outcome.
- */
-function unwrapUntrusted(text) {
-  const match = /=====UNTRUSTED_[0-9a-f]+_BEGIN=====\n([\s\S]*?)\n=====UNTRUSTED_[0-9a-f]+_END=====/.exec(text)
-  return match ? match[1] : text
-}
-
-/** Whether a failed MCP call looks like an expired/unknown session (retryable once). */
-function isSessionError(error) {
-  if (!(error instanceof ProviderError)) return false
-  return /HTTP (400|404|409|410)\b/.test(error.message) || /session/i.test(error.message)
-}
-
 class Balancer {
   constructor(providers) {
     if (!providers.length) {
@@ -694,19 +398,8 @@ class Balancer {
     const errors = []
     for (let offset = 0; offset < this.providers.length; offset++) {
       const provider = this.providers[(start + offset) % this.providers.length]
-      // `skipReason` lets a provider decline a request it cannot serve before
-      // any network call — Bright Data cannot filter by recency, and a wasted
-      // round-trip plus a timeout there would delay the next provider by a
-      // whole request budget. Declining is recorded like a failure so the
-      // caller still sees which vendors were not tried.
-      const skipReason = provider.skipSearch?.(timeRange)
-      if (skipReason) {
-        errors.push(`${provider.name}: ${skipReason}`)
-        continue
-      }
       try {
-        const timeoutMs = provider.searchTimeoutMs ?? SEARCH_TIMEOUT_MS
-        const results = await provider.search(query, maxResults, timeRange, signal, timeoutMs)
+        const results = await provider.search(query, maxResults, timeRange, signal, SEARCH_TIMEOUT_MS)
         return { provider: provider.name, results: results.slice(0, maxResults) }
       } catch (error) {
         errors.push(`${provider.name}: ${error?.message || error}`)
@@ -721,8 +414,7 @@ class Balancer {
     for (let offset = 0; offset < this.providers.length; offset++) {
       const provider = this.providers[(start + offset) % this.providers.length]
       try {
-        const timeoutMs = provider.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
-        const result = await provider.fetch(url, maxChars, live, signal, timeoutMs)
+        const result = await provider.fetch(url, maxChars, live, signal, FETCH_TIMEOUT_MS)
         return { provider: provider.name, result }
       } catch (error) {
         errors.push(`${provider.name}: ${error?.message || error}`)
@@ -738,12 +430,6 @@ function buildBalancer(env = process.env) {
   if (env.EXA_API_KEY) providers.push(new ExaProvider(env.EXA_API_KEY))
   if (env.TAVILY_API_KEY) providers.push(new TavilyProvider(env.TAVILY_API_KEY))
   if (env.FIRECRAWL_API_KEY) providers.push(new FirecrawlProvider(env.FIRECRAWL_API_KEY))
-  // The token may also be supplied under the documented alias `BRIGHTDATA_API_KEY`;
-  // the MCP URL is overridable so a self-hosted / different-region endpoint works.
-  const brightDataToken = env.BRIGHTDATA_API_TOKEN || env.BRIGHTDATA_API_KEY
-  if (brightDataToken) {
-    providers.push(new BrightDataProvider(brightDataToken, env.BRIGHTDATA_MCP_URL))
-  }
   if (!providers.length) {
     throw new Error(NO_KEY_MESSAGE)
   }
@@ -772,12 +458,7 @@ function getBalancer(env = process.env) {
  */
 function hasProviderKeys(env = process.env) {
   return Boolean(
-    env.KEENABLE_API_KEY ||
-      env.EXA_API_KEY ||
-      env.TAVILY_API_KEY ||
-      env.FIRECRAWL_API_KEY ||
-      env.BRIGHTDATA_API_TOKEN ||
-      env.BRIGHTDATA_API_KEY,
+    env.KEENABLE_API_KEY || env.EXA_API_KEY || env.TAVILY_API_KEY || env.FIRECRAWL_API_KEY,
   )
 }
 
@@ -915,15 +596,15 @@ function registerSearchTool(ctx) {
   ctx.tools.register({
     name: 'balanced_search',
     description: [
-      'Search the web through a Keenable / Exa / Tavily / Firecrawl / Bright Data round-robin pool with automatic failover.',
+      'Search the web through a Keenable / Exa / Tavily / Firecrawl round-robin pool with automatic failover.',
       'Use for current web information, links, or content summaries; supports a recency window.',
       'Prefer a single call: issue one query per call and do not fan out several searches in parallel — each query is a separate vendor request.',
-      'Configure at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / BRIGHTDATA_API_TOKEN in the environment.',
+      'Configure at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY in the environment.',
       '',
-      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl / Bright Data 搜索网页，自动故障切换。',
+      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl 搜索网页，自动故障切换。',
       '当需要最新网页信息、链接或内容摘要时使用，支持时间范围过滤。',
       '建议一次只发一个查询，不要并行发起多个搜索——每个查询都是一次独立的厂商调用。',
-      '需要配置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / BRIGHTDATA_API_TOKEN 中的至少一个。',
+      '需要配置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY 中的至少一个。',
     ].join('\n'),
     parameters: toJsonSchema({
       query: { type: 'string', required: true, description: '搜索关键词或自然语言问题 / Search keyword or natural language question' },
@@ -972,11 +653,11 @@ function registerFetchTool(ctx) {
   ctx.tools.register({
     name: 'balanced_fetch',
     description: [
-      'Fetch a URL and return clean markdown text through the same Keenable / Exa / Tavily / Firecrawl / Bright Data round-robin pool, with automatic failover.',
+      'Fetch a URL and return clean markdown text through the same Keenable / Exa / Tavily / Firecrawl round-robin pool, with automatic failover.',
       'Use when you need the full text of a web page rather than just search summaries.',
       'Prefer a single call: one URL per call.',
       '',
-      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl / Bright Data 抓取网页正文并返回 clean markdown。',
+      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl 抓取网页正文并返回 clean markdown。',
       '当你需要网页全文而不是搜索摘要时使用，建议一次只抓一个 URL。',
     ].join('\n'),
     parameters: toJsonSchema({
