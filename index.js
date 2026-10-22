@@ -47,7 +47,7 @@ const SEARCH_TIMEOUT_MS = 20_000
 const FETCH_TIMEOUT_MS = 45_000
 
 const NO_KEY_MESSAGE =
-  '未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY）'
+  '未配置任何搜索 API key（请设置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / ANYSEARCH_API_KEY / TINYFISH_API_KEY）'
 
 /** Provider id registered into the `ctx.web` seam; the `web` row pins this value. */
 const WEB_PROVIDER_ID = 'balanced'
@@ -64,7 +64,21 @@ const WEB_PROVIDER_ID = 'balanced'
  */
 const WEB_FETCH_MAX_CHARS = 100_000
 
-class ProviderError extends Error {}
+/**
+ * A vendor call that failed.
+ *
+ * `kind` classifies *why*, because the Balancer treats the classes differently:
+ * a wrong key or a spent quota must park that vendor for a while (retrying a
+ * free plan that is out of credits just burns latency on every rotation),
+ * while a plain 5xx or a timeout should be retried on the next call.
+ */
+class ProviderError extends Error {
+  /** @param {'generic'|'auth'|'quota'|'rate'} [kind] */
+  constructor(message, kind = 'generic') {
+    super(message)
+    this.kind = kind
+  }
+}
 
 function json(value) {
   return JSON.stringify(value, null, 2)
@@ -72,6 +86,28 @@ function json(value) {
 
 function isoDaysAgo(days) {
   return new Date(Date.now() - days * 86_400_000).toISOString().replace(/\.\d{3}Z$/, '.000Z')
+}
+
+/**
+ * Map an HTTP status (and its body) onto a {@link ProviderError} kind.
+ *
+ * 429 is overloaded across the pool: for some vendors it is a rate limit, for
+ * others it is a spent credit balance. Matching the body is the only portable
+ * way to tell them apart, and the difference matters — a quota failure parks
+ * the provider for far longer than a rate limit does.
+ */
+function classifyFailure(status, body) {
+  if (status === 401 || status === 403) return 'auth'
+  if (status === 402) return 'quota'
+  if (status === 429) {
+    // Rate-limit bodies talk about a rate/limit ("User rate limit exceeded",
+    // "Rate limit exceeded. Limit: 30 requests per minute"); a spent balance
+    // talks about funds/credits. Some quota bodies contain "exceeded" too, so
+    // the rate-limit phrase has to win first.
+    if (/rate[ _-]?limit/i.test(body)) return 'rate'
+    return /insufficient|quota|credit|balance|allowance|payment/i.test(body) ? 'quota' : 'rate'
+  }
+  return 'generic'
 }
 
 /**
@@ -97,7 +133,13 @@ async function requestJson(url, options = {}) {
     const response = await fetch(url, { ...rest, signal: controller.signal })
     const text = await response.text()
     if (!response.ok) {
-      throw new ProviderError(`HTTP ${response.status}: ${text.slice(0, 200)}`)
+      // Keep the vendor's own words (they carry the actionable detail, e.g.
+      // "Remaining funds: 0. Required funds: 0.005") but classify the failure
+      // so the Balancer can decide between retrying and parking the provider.
+      throw new ProviderError(
+        `HTTP ${response.status}: ${text.slice(0, 200)}`,
+        classifyFailure(response.status, text),
+      )
     }
     try {
       return JSON.parse(text)
@@ -371,12 +413,206 @@ class FirecrawlProvider {
     }
   }
 }
+/**
+ * AnySearch — POST api.anysearch.com/v1/search, `Authorization: Bearer as_sk_…`.
+ *
+ * Its free plan is a plain daily request budget (1,000 requests/day, 20 QPS per
+ * key) shared by search and extract, and no parameter changes the price — one
+ * call is one request. Two vendor limits shape this adapter instead:
+ *
+ *   * `max_results` is hard-capped at 10 server-side and anything above it is
+ *     silently truncated. Clamping here is not cosmetic: a caller that asked
+ *     for 20 and silently got 10 would report a short result set as complete.
+ *   * there is NO recency parameter. `time_range`/`freshness` are ignored
+ *     rather than rejected, so this provider advertises
+ *     `supportsTimeRange = false` and the Balancer routes a time-filtered
+ *     search to the vendors that can honour it.
+ *
+ * `extract` is the fetch capability, and its schema is strict: the JSON body
+ * may hold `url` and nothing else. Anything extra 400s with the misleading
+ * message "URL is invalid." (the real cause is surfaced as `error_code`).
+ */
+class AnySearchProvider {
+  name = 'anysearch'
+  supportsTimeRange = false
+
+  constructor(apiKey) {
+    this.apiKey = apiKey
+  }
+
+  async search(query, maxResults, timeRange, signal, timeoutMs) {
+    // `timeRange` is deliberately not sent: the endpoint has no recency field,
+    // so a filter here would be a lie. The Balancer keeps this provider out of
+    // time-filtered calls when a recency-capable vendor is available.
+    const body = { query, max_results: Math.min(maxResults, 10) }
+    const data = await requestJson('https://api.anysearch.com/v1/search', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+      timeoutMs,
+    })
+    // The envelope reports success as `code: 0`; a non-zero code on a 2xx
+    // response would otherwise read as "no results".
+    if (data && data.code !== undefined && data.code !== 0) {
+      throw new ProviderError(`anysearch: ${data.message || '搜索失败'}`)
+    }
+    return (data?.data?.results || []).map((item) => ({
+      title: item.title || '',
+      url: item.url || '',
+      // `snippet` and `content` are optional fields (absent, not null) and are
+      // near-identical in length on ordinary web search; preferring `snippet`
+      // keeps the card payload small.
+      content: String(item.snippet ?? item.content ?? '').trim(),
+      // No publication date is exposed at all — the only date-like text is an
+      // English phrase inside the snippet, which is not worth parsing.
+      provider: this.name,
+    }))
+  }
+
+  async fetch(url, maxChars, live, signal, timeoutMs) {
+    // Strict schema: exactly one key. `maxChars` and `live` have no equivalent
+    // here (extraction is always live and the server caps the body near 50k),
+    // so the cap is applied on the way back.
+    const data = await requestJson('https://api.anysearch.com/v1/extract', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ url }),
+      signal,
+      timeoutMs,
+    })
+    const doc = data?.data
+    if (!doc) throw new ProviderError('anysearch 抓取无结果')
+    const raw = String(doc.content ?? '').trim()
+    if (raw === '') throw new ProviderError('anysearch 抓取返回空正文')
+    return {
+      url: doc.url || url,
+      title: doc.title || '',
+      content: maxChars && raw.length > maxChars ? raw.slice(0, maxChars) : raw,
+      provider: this.name,
+    }
+  }
+}
+
+/** TinyFish expresses recency as a relative window in minutes. */
+const TINYFISH_RECENCY_MINUTES = { day: 1440, week: 10080, month: 43200, year: 525600 }
+
+/**
+ * TinyFish — GET api.search.tinyfish.ai / POST api.fetch.tinyfish.ai,
+ * `X-API-Key: sk-tinyfish-…` (NOT Bearer — the API rejects an
+ * `Authorization` header outright).
+ *
+ * Search and Fetch are both free on every plan ($0.00, no wallet draw), with
+ * generous daily allowances (12,000 searches/day at 500/hour, 1,000 fetched
+ * URLs/day), so the adapter's job is fitting the shape, not saving money:
+ *
+ *   * search is a GET with all parameters in the query string;
+ *   * it has NO `maxResults` parameter — every page is exactly 10 results.
+ *     Asking for more than 10 costs a second request with `page=1`; pages
+ *     overlap by a result or so, so the merge dedupes by URL.
+ *   * `recency_minutes` is a relative window, so a time-filtered search is
+ *     honoured precisely (unlike AnySearch).
+ *   * fetch returns HTTP 200 even when the page failed: the per-URL failure
+ *     lives in `errors[]`, which must be checked before trusting `results`.
+ */
+class TinyFishProvider {
+  name = 'tinyfish'
+
+  constructor(apiKey) {
+    this.apiKey = apiKey
+  }
+
+  async #searchPage(query, timeRange, page, signal, timeoutMs) {
+    const params = new URLSearchParams({ query })
+    if (timeRange) params.set('recency_minutes', String(TINYFISH_RECENCY_MINUTES[timeRange]))
+    if (page > 0) params.set('page', String(page))
+    const data = await requestJson(`https://api.search.tinyfish.ai?${params}`, {
+      headers: { 'X-API-Key': this.apiKey },
+      signal,
+      timeoutMs,
+    })
+    return data.results || []
+  }
+
+  async search(query, maxResults, timeRange, signal, timeoutMs) {
+    const first = await this.#searchPage(query, timeRange, 0, signal, timeoutMs)
+    // The second page only pays off when the caller asked for more than one
+    // page worth of results; below that the Balancer trims to maxResults.
+    const pages = maxResults > 10 ? [first, await this.#searchPage(query, timeRange, 1, signal, timeoutMs)] : [first]
+    const seen = new Set()
+    const results = []
+    for (const item of pages.flat()) {
+      const url = item?.url || ''
+      if (url === '' || seen.has(url)) continue
+      seen.add(url)
+      results.push({
+        title: item.title || '',
+        url,
+        content: String(item.snippet ?? '').trim(),
+        // `results[].date` is a human string ("8 hours ago", "May 4, 2026"),
+        // not ISO 8601 and often absent. Guessing an instant from it would
+        // fabricate precision the vendor never provided, so it stays unset.
+        provider: this.name,
+      })
+    }
+    return results
+  }
+
+  async fetch(url, maxChars, live, signal, timeoutMs) {
+    const body = { urls: [url], format: 'markdown' }
+    // Omitting `ttl` accepts any cached copy; `ttl: 0` is the vendor's "go to
+    // the origin" and is what `live` maps to everywhere in this plugin.
+    if (live) body.ttl = 0
+    const data = await requestJson('https://api.fetch.tinyfish.ai', {
+      method: 'POST',
+      headers: { 'X-API-Key': this.apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+      timeoutMs,
+    })
+    const item = (data.results || [])[0]
+    if (!item) {
+      const failure = (data.errors || [])[0]
+      throw new ProviderError(
+        failure
+          ? `tinyfish 抓取失败: ${failure.error}${failure.status ? ` (HTTP ${failure.status})` : ''}`
+          : 'tinyfish 抓取无结果',
+      )
+    }
+    const raw = String(item.text ?? '').trim()
+    if (raw === '') throw new ProviderError('tinyfish 抓取返回空正文')
+    return {
+      url: item.final_url || item.url || url,
+      title: item.title || item.description || '',
+      content: maxChars && raw.length > maxChars ? raw.slice(0, maxChars) : raw,
+      provider: this.name,
+    }
+  }
+}
+
+/**
+ * How long a provider is skipped after a classified failure.
+ *
+ * A quota/auth failure parks the vendor for tens of minutes: the free plans in
+ * this pool are monthly, so hammering a dry key on every rotation buys nothing
+ * but latency. A rate limit only needs a short pause. These stay far below the
+ * quota period on purpose — the user may top a vendor up mid-session, and an
+ * unnecessary restart to notice that would be worse than one wasted attempt.
+ */
+const COOLDOWN_MS = { auth: 30 * 60_000, quota: 20 * 60_000, rate: 30_000 }
+
 class Balancer {
   constructor(providers) {
     if (!providers.length) {
       throw new Error('至少需要一个 provider')
     }
     this.providers = providers
+    // Capability-scoped lists: a vendor that only sells search, or one whose
+    // fetch endpoint this adapter does not implement, must not consume a slot
+    // in the fetch rotation — otherwise every Nth fetch pays a guaranteed
+    // failed round trip before the failover moves on.
+    this.searchProviders = providers.filter((provider) => provider.canSearch !== false)
+    this.fetchProviders = providers.filter((provider) => provider.canFetch !== false)
     // One cursor per capability, deliberately NOT shared: search and fetch are
     // consumed at different rates, and a shared cursor makes the rotation
     // collapse. With exactly two providers and an alternating
@@ -384,24 +620,54 @@ class Balancer {
     // every fetch to provider B, defeating the round-robin entirely.
     this.nextSearch = 0
     this.nextFetch = 0
+    // provider.name → epoch ms until which this provider is skipped.
+    this.cooldownUntil = new Map()
   }
 
   /** Claim the next starting index for one capability and advance its cursor. */
-  #take(cursor) {
-    const start = this[cursor]
-    this[cursor] = (this[cursor] + 1) % this.providers.length
+  #take(list, cursor) {
+    const start = this[cursor] % list.length
+    this[cursor] = (this[cursor] + 1) % list.length
     return start
   }
 
+  /**
+   * The providers worth trying now, preserving round-robin order.
+   *
+   * If every provider is cooling down, they are all returned anyway: a stale
+   * cooldown must never escalate into "no provider configured".
+   */
+  #usable(list) {
+    const now = Date.now()
+    const fresh = list.filter((provider) => (this.cooldownUntil.get(provider.name) ?? 0) <= now)
+    return fresh.length ? fresh : list
+  }
+
+  #park(provider, error) {
+    const ms = COOLDOWN_MS[error?.kind]
+    if (ms) this.cooldownUntil.set(provider.name, Date.now() + ms)
+  }
+
   async search(query, maxResults, timeRange, signal) {
-    const start = this.#take('nextSearch')
+    let list = this.#usable(this.searchProviders)
+    if (timeRange) {
+      // Not every vendor can filter by recency (AnySearch has no such
+      // parameter at all), and serving unfiltered results for a filtered
+      // request silently breaks the caller's contract. Keep the capable
+      // vendors in the rotation and fall back to the whole pool only when
+      // none of them can serve the request.
+      const capable = list.filter((provider) => provider.supportsTimeRange !== false)
+      if (capable.length) list = capable
+    }
+    const start = this.#take(list, 'nextSearch')
     const errors = []
-    for (let offset = 0; offset < this.providers.length; offset++) {
-      const provider = this.providers[(start + offset) % this.providers.length]
+    for (let offset = 0; offset < list.length; offset++) {
+      const provider = list[(start + offset) % list.length]
       try {
         const results = await provider.search(query, maxResults, timeRange, signal, SEARCH_TIMEOUT_MS)
         return { provider: provider.name, results: results.slice(0, maxResults) }
       } catch (error) {
+        this.#park(provider, error)
         errors.push(`${provider.name}: ${error?.message || error}`)
       }
     }
@@ -409,14 +675,19 @@ class Balancer {
   }
 
   async fetch(url, maxChars, live, signal) {
-    const start = this.#take('nextFetch')
+    if (!this.fetchProviders.length) {
+      throw new ProviderError('没有支持抓取的 provider')
+    }
+    const list = this.#usable(this.fetchProviders)
+    const start = this.#take(list, 'nextFetch')
     const errors = []
-    for (let offset = 0; offset < this.providers.length; offset++) {
-      const provider = this.providers[(start + offset) % this.providers.length]
+    for (let offset = 0; offset < list.length; offset++) {
+      const provider = list[(start + offset) % list.length]
       try {
         const result = await provider.fetch(url, maxChars, live, signal, FETCH_TIMEOUT_MS)
         return { provider: provider.name, result }
       } catch (error) {
+        this.#park(provider, error)
         errors.push(`${provider.name}: ${error?.message || error}`)
       }
     }
@@ -430,11 +701,18 @@ function buildBalancer(env = process.env) {
   if (env.EXA_API_KEY) providers.push(new ExaProvider(env.EXA_API_KEY))
   if (env.TAVILY_API_KEY) providers.push(new TavilyProvider(env.TAVILY_API_KEY))
   if (env.FIRECRAWL_API_KEY) providers.push(new FirecrawlProvider(env.FIRECRAWL_API_KEY))
+  if (env.ANYSEARCH_API_KEY) providers.push(new AnySearchProvider(env.ANYSEARCH_API_KEY))
+  if (env.TINYFISH_API_KEY) providers.push(new TinyFishProvider(env.TINYFISH_API_KEY))
   if (!providers.length) {
     throw new Error(NO_KEY_MESSAGE)
   }
   return new Balancer(providers)
 }
+
+// Exported for scripts/probe.mjs, which builds a single-provider Balancer to
+// test one vendor in isolation. The dsh plugin loader only reads `name`,
+// `inject` and `apply`, so an extra export is inert at runtime.
+export { buildBalancer }
 
 let _balancer = null
 
@@ -458,7 +736,12 @@ function getBalancer(env = process.env) {
  */
 function hasProviderKeys(env = process.env) {
   return Boolean(
-    env.KEENABLE_API_KEY || env.EXA_API_KEY || env.TAVILY_API_KEY || env.FIRECRAWL_API_KEY,
+    env.KEENABLE_API_KEY ||
+      env.EXA_API_KEY ||
+      env.TAVILY_API_KEY ||
+      env.FIRECRAWL_API_KEY ||
+      env.ANYSEARCH_API_KEY ||
+      env.TINYFISH_API_KEY,
   )
 }
 
@@ -596,15 +879,15 @@ function registerSearchTool(ctx) {
   ctx.tools.register({
     name: 'balanced_search',
     description: [
-      'Search the web through a Keenable / Exa / Tavily / Firecrawl round-robin pool with automatic failover.',
+      'Search the web through a Keenable / Exa / Tavily / Firecrawl / AnySearch / TinyFish round-robin pool with automatic failover.',
       'Use for current web information, links, or content summaries; supports a recency window.',
       'Prefer a single call: issue one query per call and do not fan out several searches in parallel — each query is a separate vendor request.',
-      'Configure at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY in the environment.',
+      'Configure at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / ANYSEARCH_API_KEY / TINYFISH_API_KEY in the environment.',
       '',
-      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl 搜索网页，自动故障切换。',
+      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl / AnySearch / TinyFish 搜索网页，自动故障切换。',
       '当需要最新网页信息、链接或内容摘要时使用，支持时间范围过滤。',
       '建议一次只发一个查询，不要并行发起多个搜索——每个查询都是一次独立的厂商调用。',
-      '需要配置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY 中的至少一个。',
+      '需要配置 KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY / ANYSEARCH_API_KEY / TINYFISH_API_KEY 中的至少一个。',
     ].join('\n'),
     parameters: toJsonSchema({
       query: { type: 'string', required: true, description: '搜索关键词或自然语言问题 / Search keyword or natural language question' },
@@ -653,11 +936,11 @@ function registerFetchTool(ctx) {
   ctx.tools.register({
     name: 'balanced_fetch',
     description: [
-      'Fetch a URL and return clean markdown text through the same Keenable / Exa / Tavily / Firecrawl round-robin pool, with automatic failover.',
+      'Fetch a URL and return clean markdown text through the same Keenable / Exa / Tavily / Firecrawl / AnySearch / TinyFish round-robin pool, with automatic failover.',
       'Use when you need the full text of a web page rather than just search summaries.',
       'Prefer a single call: one URL per call.',
       '',
-      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl 抓取网页正文并返回 clean markdown。',
+      '中文：轮流调用 Keenable / Exa / Tavily / Firecrawl / AnySearch / TinyFish 抓取网页正文并返回 clean markdown。',
       '当你需要网页全文而不是搜索摘要时使用，建议一次只抓一个 URL。',
     ].join('\n'),
     parameters: toJsonSchema({

@@ -13,14 +13,16 @@
 #
 # `index.js` registers a `ctx.web` provider with id `balanced` (it serves both
 # the search and the fetch capability), so pinning the two provider ids here
-# routes the built-in tools through the Keenable / Exa / Tavily / Firecrawl
-# round-robin pool instead of the shipped `deepseek-official` search and `http`
-# fetch backends.
+# routes the built-in tools through the Keenable / Exa / Tavily / Firecrawl /
+# AnySearch / TinyFish round-robin pool instead of the shipped
+# `deepseek-official` search and `http` fetch backends.
 #
-# This is the plugin's ONLY effect: it registers no tools of its own, so the
-# model keeps seeing exactly the built-in `web_search` / `web_fetch` — which is
-# what gives the takeover the official search card, globe icon and step wording
-# in the GUI.
+# The bundle has a second, independent surface: `index.js` also registers the
+# plugin-owned `balanced_search` / `balanced_fetch` tools (they carry
+# `time_range`, an explicit result count and `max_chars`/`live`, which the seam
+# request does not). The two surfaces share one provider pool. The takeover
+# below is what gives the built-in tools the official search card, globe icon
+# and step wording in the GUI.
 #
 # Two mechanics worth knowing:
 #
@@ -30,7 +32,8 @@
 #     these two lines remain overridable (and removable) per profile.
 #
 # Requires at least one of KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY /
-# FIRECRAWL_API_KEY. With none set the provider reports itself unavailable, and
+# FIRECRAWL_API_KEY / ANYSEARCH_API_KEY / TINYFISH_API_KEY. With none set the
+# provider reports itself unavailable, and
 # the built-in tools fail with
 # `WEB_PROVIDER_CONFIGURED_UNAVAILABLE` naming `balanced` — there is no fallback
 # to the shipped providers. Remove these two lines to fall back.

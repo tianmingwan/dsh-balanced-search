@@ -1,11 +1,12 @@
-"""balanced-search MCP server — 轮流调用四个搜索后端（Keenable / Exa / Tavily /
-Firecrawl）。
+"""balanced-search MCP server — 轮流调用六个搜索后端（Keenable / Exa / Tavily /
+Firecrawl / AnySearch / TinyFish）。
 
 用法:
     python server.py            # stdio 模式，供 MCP 客户端（如 ZCode）连接
 
 环境变量（至少配置一个，未配置的后端会被跳过）:
-    KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY
+    KEENABLE_API_KEY / EXA_API_KEY / TAVILY_API_KEY / FIRECRAWL_API_KEY /
+    ANYSEARCH_API_KEY / TINYFISH_API_KEY
 也可在同目录 .env 文件中配置（本地测试用）。
 """
 from __future__ import annotations
@@ -43,13 +44,14 @@ def _get_balancer():
 def search(query: str, max_results: int = 8, time_range: Optional[str] = None) -> str:
     """搜索网页，返回标题、链接和内容摘要。
 
-    四个搜索服务（Keenable / Exa / Tavily / Firecrawl）轮流调用，某个服务失败时自动
-    切换下一个。用于替代内置 WebSearch/WebFetch 的联网搜索场景。
+    六个搜索服务（Keenable / Exa / Tavily / Firecrawl / AnySearch / TinyFish）轮流
+    调用，某个服务失败时自动切换下一个。用于替代内置 WebSearch/WebFetch 的联网搜索场景。
 
     Args:
         query: 搜索关键词或自然语言问题。
         max_results: 返回结果条数，1-20，默认 8。
         time_range: 可选，只返回该时间范围内的结果：day / week / month / year。
+            该过滤只由支持回溯的厂商承担（AnySearch 没有 recency 参数，会被跳过）。
     """
     query = (query or "").strip()
     if not query:
@@ -86,9 +88,10 @@ def search(query: str, max_results: int = 8, time_range: Optional[str] = None) -
 def fetch(url: str, max_chars: int = 30000, live: bool = False) -> str:
     """抓取指定 URL 的网页正文，返回 clean markdown 文本。
 
-    四个服务（Keenable / Exa / Tavily / Firecrawl）轮流调用，某个服务失败时自动切换
-    下一个。Keenable 默认只支持其索引内的 URL，传 live=true 可直接从源站抓取（含未索引
-    URL）。Firecrawl 还会附带原页面的 status_code。
+    六个服务（Keenable / Exa / Tavily / Firecrawl / AnySearch / TinyFish）轮流调用，
+    某个服务失败时自动切换下一个。Keenable 默认只支持其索引内的 URL，传 live=true 可
+    直接从源站抓取（含未索引 URL）。Firecrawl 还会附带原页面的 status_code；AnySearch
+    与 TinyFish 的抓取始终是实时的，live 参数对它们无效。
 
     Args:
         url: 要抓取的网页地址。
